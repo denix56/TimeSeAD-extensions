@@ -237,16 +237,16 @@ def _dcl_score(z: torch.Tensor, temperature: float, eval: bool) -> torch.Tensor:
     z_trans = z[:, 1:]
     batch_size, num_trans, _ = z.shape
 
-    sim_matrix = torch.exp(torch.matmul(z, z.permute(0, 2, 1) / temperature))
-    mask = (torch.ones_like(sim_matrix).to(z) - torch.eye(num_trans).unsqueeze(0).to(z)).bool()
-    sim_matrix = sim_matrix.masked_select(mask).view(batch_size, num_trans, -1)
-    trans_matrix = sim_matrix[:, 1:].sum(-1)
+    logits = torch.matmul(z, z.permute(0, 2, 1)) / temperature
+    mask = (torch.ones_like(logits).to(z) - torch.eye(num_trans).unsqueeze(0).to(z)).bool()
+    logits = logits.masked_select(mask).view(batch_size, num_trans, -1)
+    trans_logsumexp = torch.logsumexp(logits[:, 1:], dim=-1)
 
-    pos_sim = torch.exp(torch.sum(z_trans * z_ori.unsqueeze(1), -1) / temperature)
+    pos_log = torch.sum(z_trans * z_ori.unsqueeze(1), -1) / temperature
     k_trans = num_trans - 1
     scale = 1 / np.abs(k_trans * np.log(1.0 / k_trans))
 
-    loss_tensor = (torch.log(trans_matrix) - torch.log(pos_sim)) * scale
+    loss_tensor = (trans_logsumexp - pos_log) * scale
 
     score = loss_tensor.sum(1)
     if eval:
@@ -256,17 +256,15 @@ def _dcl_score(z: torch.Tensor, temperature: float, eval: bool) -> torch.Tensor:
 
 def _eucdcl_score(z: torch.Tensor, temperature: float, eval: bool) -> torch.Tensor:
     batch_size, num_trans, _ = z.shape
-    sim_matrix = -torch.cdist(z, z)
-    sim_matrix = torch.exp(sim_matrix / temperature)
-    mask = (torch.ones_like(sim_matrix).to(z) - torch.eye(num_trans).unsqueeze(0).to(z)).bool()
-    sim_matrix = sim_matrix.masked_select(mask).view(batch_size, num_trans, -1)
-    sim_matrix = sim_matrix + 1e-8
-    trans_matrix = sim_matrix[:, 1:].sum(-1)
-    pos_sim = sim_matrix[:, 1:, 0]
+    logits = -torch.cdist(z, z) / temperature
+    mask = (torch.ones_like(logits).to(z) - torch.eye(num_trans).unsqueeze(0).to(z)).bool()
+    logits = logits.masked_select(mask).view(batch_size, num_trans, -1)
+    trans_logsumexp = torch.logsumexp(logits[:, 1:], dim=-1)
+    pos_log = logits[:, 1:, 0]
 
     k_trans = num_trans - 1
     scale = 1 / np.abs(k_trans * np.log(1.0 / k_trans))
-    score = (-torch.log(pos_sim) + torch.log(trans_matrix)) * scale
+    score = (-pos_log + trans_logsumexp) * scale
     score = score.sum(1)
     if eval:
         return score
