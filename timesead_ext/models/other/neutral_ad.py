@@ -191,7 +191,7 @@ class NeutralAD(BaseModel):
                  batch_norm: bool = False, enc_bias: bool = False):
         super().__init__()
 
-        assert num_trans > 0, 'num_trans must be > 0'
+        assert num_trans > 1, 'num_trans must be > 1'
         self.num_trans = num_trans
         self.trans_type = trans_type
         self.z_dim = latent_dim
@@ -264,7 +264,7 @@ def _eucdcl_score(z: torch.Tensor, temperature: float, eval: bool) -> torch.Tens
     pos_log = logits[:, 1:, 0]
 
     k_trans = num_trans - 1
-    scale = 1 / np.abs(k_trans * np.log(1.0 / k_trans)) if k_trans > 1 else 1.0
+    scale = 1 / np.abs(k_trans * np.log(1.0 / k_trans))
     score = (-pos_log + trans_logsumexp) * scale
     score = score.sum(1)
     if eval:
