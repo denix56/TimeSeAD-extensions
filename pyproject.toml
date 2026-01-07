@@ -7,7 +7,6 @@ requires-python = ">=3.12"
 license = "AGPL-3.0-or-later"
 
 dependencies = [
-  "numpy<2.4.0",
   "torch>=2.6",
   # "treeple", # For now we need to build from source (please refer to README.md)
 ]
