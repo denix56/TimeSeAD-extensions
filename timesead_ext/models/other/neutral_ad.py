@@ -276,7 +276,7 @@ class NeutralADLoss(Loss):
         self.use_euclidean = use_euclidean
 
     def forward(self, predictions: Tuple[torch.Tensor, ...], targets: Tuple[torch.Tensor, ...] = None,
-                eval: bool = False) -> torch.Tensor:
+                eval: bool = False, *args, **kwargs) -> torch.Tensor:
         z, = predictions
         if self.use_euclidean:
             return _eucdcl_score(z, self.temperature, eval=eval)
