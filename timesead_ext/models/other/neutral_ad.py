@@ -212,18 +212,15 @@ class NeutralAD(BaseModel):
         x = x.float()
         x = x.permute(0, 2, 1)
 
-        x_t = torch.empty(x.shape[0], self.num_trans, x.shape[1], x.shape[2]).to(x)
-        for i in range(self.num_trans):
-            mask = self.trans[i](x)
-            if self.trans_type == 'forward':
-                x_t[:, i] = mask
-            elif self.trans_type == 'mul':
-                mask = torch.sigmoid(mask)
-                x_t[:, i] = mask * x
-            elif self.trans_type == 'residual':
-                x_t[:, i] = mask + x
-            else:
-                raise ValueError(f'Unknown trans_type: {self.trans_type}')
+        masks = [self.trans[i](x) for i in range(self.num_trans)]
+        if self.trans_type == 'forward':
+            x_t = torch.stack(masks, dim=1)
+        elif self.trans_type == 'mul':
+            x_t = torch.stack([torch.sigmoid(mask) for mask in masks], dim=1) * x.unsqueeze(1)
+        elif self.trans_type == 'residual':
+            x_t = torch.stack(masks, dim=1) + x.unsqueeze(1)
+        else:
+            raise ValueError(f'Unknown trans_type: {self.trans_type}')
 
         x_cat = torch.cat([x.unsqueeze(1), x_t], 1)
         zs = self.enc[0](x_cat.reshape(-1, x.shape[1], x.shape[2]))
