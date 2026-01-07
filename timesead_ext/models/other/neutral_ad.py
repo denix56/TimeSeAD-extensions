@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from timesead.models.common import AnomalyDetector
 from timesead.models import BaseModel
 from timesead.optim.loss import Loss
+from timesead.utils.utils import pack_tuple
 
 
 class ResTrans1DBlock(torch.nn.Module):
@@ -278,8 +279,8 @@ class NeutralADLoss(Loss):
         self.temperature = temperature
         self.use_euclidean = use_euclidean
 
-    def forward(self, predictions: Tuple[torch.Tensor, ...], targets: Tuple[torch.Tensor, ...],
-                eval: bool = False, *args, **kwargs) -> torch.Tensor:
+    def forward(self, predictions: Tuple[torch.Tensor, ...], targets: Tuple[torch.Tensor, ...] = None,
+                eval: bool = False) -> torch.Tensor:
         z, = predictions
         if self.use_euclidean:
             return _eucdcl_score(z, self.temperature, eval=eval)
@@ -293,9 +294,10 @@ class NeutralADAnomalyDetector(AnomalyDetector):
         self.loss = loss
 
     def compute_online_anomaly_score(self, inputs: Tuple[torch.Tensor, ...]) -> torch.Tensor:
-        with torch.no_grad():
-            z = self.model(inputs)
-        return self.loss((z,), (), eval=True)
+        with torch.inference_mode():
+            z = pack_tuple(self.model(inputs))
+
+        return self.loss(z, eval=True)
 
     def compute_offline_anomaly_score(self, inputs: Tuple[torch.Tensor, ...]) -> torch.Tensor:
         raise NotImplementedError
