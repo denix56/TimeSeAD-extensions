@@ -1,0 +1,11 @@
+[project]
+name = "timesead-extensions"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+
+dependencies = [
+  "numpy<2.4.0",
+  "torch>=2.6",
+  # "treeple", # For now we need to build from source (please refer to README.md)
+]
