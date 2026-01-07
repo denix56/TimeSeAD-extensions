@@ -73,8 +73,7 @@ class SeqTransformNet(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.relu(self.in1(self.conv1(x)))
-        for block in self.res:
-            out = block(out)
+        out = self.res(out)
         out = self.conv2(out)
         return out
 
