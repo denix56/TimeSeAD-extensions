@@ -16,7 +16,7 @@
 
 from typing import Tuple
 
-import numpy as np
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -144,7 +144,7 @@ class SeqEncoder(nn.Module):
             out_dim = h_dim * 2 ** i
             enc.append(self._make_layer(in_dim, out_dim, (3, 2, 1)))
             in_dim = out_dim
-            window_size = np.floor((window_size + 2 - 3) / 2) + 1
+            window_size = math.floor((window_size + 2 - 3) / 2) + 1
 
         self.enc = nn.Sequential(*enc)
         self.final_layer = nn.Conv1d(in_dim, z_dim, int(window_size), 1, 0)
@@ -242,7 +242,7 @@ def _dcl_score(z: torch.Tensor, temperature: float, eval: bool) -> torch.Tensor:
 
     pos_log = torch.sum(z_trans * z_ori.unsqueeze(1), -1) / temperature
     k_trans = num_trans - 1
-    scale = 1 / np.abs(k_trans * np.log(1.0 / k_trans)) if k_trans > 1 else 1.0
+    scale = 1 / abs(k_trans * math.log(1.0 / k_trans))
 
     loss_tensor = (trans_logsumexp - pos_log) * scale
 
@@ -261,7 +261,7 @@ def _eucdcl_score(z: torch.Tensor, temperature: float, eval: bool) -> torch.Tens
     pos_log = logits[:, 1:, 0]
 
     k_trans = num_trans - 1
-    scale = 1 / np.abs(k_trans * np.log(1.0 / k_trans))
+    scale = 1 / abs(k_trans * math.log(1.0 / k_trans))
     score = (-pos_log + trans_logsumexp) * scale
     score = score.sum(1)
     if eval:
