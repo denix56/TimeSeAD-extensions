@@ -233,11 +233,11 @@ def _dcl_score(z: torch.Tensor, temperature: float, eval: bool) -> torch.Tensor:
     z = F.normalize(z, p=2, dim=-1)
     z_ori = z[:, 0]
     z_trans = z[:, 1:]
-    batch_size, num_trans, _ = z.shape
+    num_trans = z.shape[1]
 
     logits = torch.matmul(z, z.mT) / temperature
-    mask = (torch.ones_like(logits) - torch.eye(num_trans).unsqueeze(0).to(z)).bool()
-    logits = logits.masked_select(mask).view(batch_size, num_trans, -1)
+    diag_mask = torch.eye(num_trans, device=z.device, dtype=torch.bool)
+    logits = logits.masked_fill(diag_mask, float('-inf'))
     trans_logsumexp = torch.logsumexp(logits[:, 1:], dim=-1)
 
     pos_log = torch.sum(z_trans * z_ori.unsqueeze(1), -1) / temperature
@@ -253,10 +253,10 @@ def _dcl_score(z: torch.Tensor, temperature: float, eval: bool) -> torch.Tensor:
 
 
 def _eucdcl_score(z: torch.Tensor, temperature: float, eval: bool) -> torch.Tensor:
-    batch_size, num_trans, _ = z.shape
+    num_trans = z.shape[1]
     logits = -torch.cdist(z, z) / temperature
-    mask = (torch.ones_like(logits) - torch.eye(num_trans).unsqueeze(0).to(z)).bool()
-    logits = logits.masked_select(mask).view(batch_size, num_trans, -1)
+    diag_mask = torch.eye(num_trans, device=z.device, dtype=torch.bool)
+    logits = logits.masked_fill(diag_mask, float('-inf'))
     trans_logsumexp = torch.logsumexp(logits[:, 1:], dim=-1)
     pos_log = logits[:, 1:, 0]
 
