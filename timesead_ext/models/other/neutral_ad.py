@@ -165,25 +165,24 @@ class SeqEncoder(nn.Module):
         return z.squeeze(-1)
 
 
-class SeqNets:
-    def _make_nets(self, x_dim: int, config: dict):
-        enc_nlayers = config['enc_nlayers']
-        enc_hdim = config['enc_hdim']
-        z_dim = config['latent_dim']
-        x_len = config['x_length']
-        trans_nlayers = config['trans_nlayers']
-        num_trans = config['num_trans']
-        batch_norm = config['batch_norm']
+def make_seq_nets(x_dim: int, config: dict):
+    enc_nlayers = config['enc_nlayers']
+    enc_hdim = config['enc_hdim']
+    z_dim = config['latent_dim']
+    x_len = config['x_length']
+    trans_nlayers = config['trans_nlayers']
+    num_trans = config['num_trans']
+    batch_norm = config['batch_norm']
 
-        enc = nn.ModuleList([
-            SeqEncoder(x_dim, x_len, enc_hdim, z_dim, config['enc_bias'], enc_nlayers, batch_norm)
-            for _ in range(num_trans + 1)
-        ])
-        trans = nn.ModuleList([
-            SeqTransformNet(x_dim, x_dim, trans_nlayers) for _ in range(num_trans)
-        ])
+    enc = nn.ModuleList([
+        SeqEncoder(x_dim, x_len, enc_hdim, z_dim, config['enc_bias'], enc_nlayers, batch_norm)
+        for _ in range(num_trans + 1)
+    ])
+    trans = nn.ModuleList([
+        SeqTransformNet(x_dim, x_dim, trans_nlayers) for _ in range(num_trans)
+    ])
 
-        return enc, trans
+    return enc, trans
 
 
 class NeutralAD(BaseModel):
@@ -206,7 +205,7 @@ class NeutralAD(BaseModel):
             batch_norm=batch_norm,
             enc_bias=enc_bias
         )
-        self.enc, self.trans = SeqNets()._make_nets(ts_channels, config)
+        self.enc, self.trans = make_seq_nets(ts_channels, config)
 
     def forward(self, inputs: Tuple[torch.Tensor, ...]) -> torch.Tensor:
         x, = inputs
