@@ -35,6 +35,7 @@ from timesead_ext.models.transforms import (
     make_group_family,
     make_invertible_family,
 )
+from timesead_ext.models.encoders import ITransformerEncoder, PatchTSTEncoder
 
 
 class ResTrans1DBlock(torch.nn.Module):
@@ -200,11 +201,18 @@ class NeutralAD(BaseModel):
                  keep_base_transforms: bool = True,
                  invertible_cfg: Optional[Dict[str, object]] = None,
                  group_cfg: Optional[Dict[str, object]] = None,
-                 freq_cfg: Optional[Dict[str, object]] = None):
+                 freq_cfg: Optional[Dict[str, object]] = None,
+                 encoder_type: str = "base",
+                 encoder_cfg: Optional[Dict[str, object]] = None,
+                 pooling: str = "mean",
+                 proj_head: str = "linear",
+                 proj_cfg: Optional[Dict[str, object]] = None):
         super().__init__()
 
         self.trans_type = trans_type
         self.z_dim = latent_dim
+        self.encoder_type = encoder_type
+        self.pooling = pooling
         transforms: List[Transform] = []
         if keep_base_transforms:
             if num_trans < 1:
@@ -228,16 +236,46 @@ class NeutralAD(BaseModel):
             raise ValueError('At least one transform must be configured for NeutralAD')
         self.transform_bank = TransformBank(transforms)
         self.num_trans = len(self.transform_bank)
-        config = dict(
-            enc_nlayers=enc_nlayers,
-            enc_hdim=enc_hdim,
-            latent_dim=latent_dim,
-            x_length=seq_len,
-            num_trans=self.num_trans,
-            batch_norm=batch_norm,
-            enc_bias=enc_bias
-        )
-        self.enc = make_seq_nets(ts_channels, config)
+        self.proj = nn.Identity()
+        if encoder_type == "base":
+            config = dict(
+                enc_nlayers=enc_nlayers,
+                enc_hdim=enc_hdim,
+                latent_dim=latent_dim,
+                x_length=seq_len,
+                num_trans=self.num_trans,
+                batch_norm=batch_norm,
+                enc_bias=enc_bias
+            )
+            self.enc = make_seq_nets(ts_channels, config)
+        else:
+            encoder_cfg = encoder_cfg or {}
+            proj_cfg = proj_cfg or {}
+            if encoder_type == "patchtst":
+                encoder = PatchTSTEncoder(seq_len=seq_len, pooling=pooling, **encoder_cfg)
+            elif encoder_type == "itransformer":
+                encoder = ITransformerEncoder(seq_len=seq_len, pooling=pooling, **encoder_cfg)
+            else:
+                raise ValueError(f"Unknown encoder_type: {encoder_type}")
+            self.enc = nn.ModuleList([encoder])
+            self.proj = self._make_proj_head(encoder.d_model, latent_dim, proj_head, proj_cfg)
+
+    @staticmethod
+    def _make_proj_head(input_dim: int, output_dim: int, proj_head: str, proj_cfg: Dict[str, object]) -> nn.Module:
+        if proj_head in {"identity", "none"}:
+            return nn.Identity()
+        if proj_head == "linear":
+            return nn.Linear(input_dim, output_dim, **proj_cfg)
+        if proj_head == "mlp":
+            hidden_dim = int(proj_cfg.get("hidden_dim", input_dim))
+            dropout = float(proj_cfg.get("dropout", 0.0))
+            return nn.Sequential(
+                nn.Linear(input_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden_dim, output_dim),
+            )
+        raise ValueError(f"Unknown proj_head: {proj_head}")
 
     def forward(self, inputs: Tuple[torch.Tensor, ...]) -> torch.Tensor:
         x, = inputs
@@ -256,6 +294,7 @@ class NeutralAD(BaseModel):
 
         x_cat = torch.cat([x.unsqueeze(1), x_t], 1)
         zs = self.enc[0](x_cat.reshape(-1, x.shape[1], x.shape[2]))
+        zs = self.proj(zs)
         zs = zs.reshape(x.shape[0], self.num_trans + 1, self.z_dim)
 
         return zs
