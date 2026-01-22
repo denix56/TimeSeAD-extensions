@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import math
 import torch
@@ -25,7 +25,16 @@ from timesead.models.common import AnomalyDetector
 from timesead.models import BaseModel
 from timesead.optim.loss import Loss
 from timesead.utils.utils import pack_tuple
-from timesead_ext.models.transforms import Transform, TransformBank
+from timesead_ext.models.transforms import (
+    Transform,
+    TransformBank,
+    freq_cfg as default_freq_cfg,
+    group_cfg as default_group_cfg,
+    invertible_cfg as default_invertible_cfg,
+    make_freq_family,
+    make_group_family,
+    make_invertible_family,
+)
 
 
 class ResTrans1DBlock(torch.nn.Module):
@@ -184,16 +193,39 @@ class NeutralAD(BaseModel):
     def __init__(self, ts_channels: int, seq_len: int, num_trans: int = 4, trans_type: str = 'residual',
                  enc_hdim: int = 32, enc_nlayers: int = 4, trans_nlayers: int = 4, latent_dim: int = 32,
                  batch_norm: bool = False, enc_bias: bool = False,
-                 transform_families: Optional[Sequence[Sequence[Transform]]] = None):
+                 transform_families: Optional[Sequence[Sequence[Transform]]] = None,
+                 use_invertible_transforms: bool = False,
+                 use_group_transforms: bool = False,
+                 use_freq_ortho_transforms: bool = False,
+                 keep_base_transforms: bool = True,
+                 invertible_cfg: Optional[Dict[str, object]] = None,
+                 group_cfg: Optional[Dict[str, object]] = None,
+                 freq_cfg: Optional[Dict[str, object]] = None):
         super().__init__()
 
-        assert num_trans > 1, 'num_trans must be > 1'
         self.trans_type = trans_type
         self.z_dim = latent_dim
-        transforms = [SeqTransformNet(ts_channels, ts_channels, trans_nlayers) for _ in range(num_trans)]
+        transforms: List[Transform] = []
+        if keep_base_transforms:
+            if num_trans < 1:
+                raise ValueError('num_trans must be >= 1 when keep_base_transforms is True')
+            transforms.extend(
+                [SeqTransformNet(ts_channels, ts_channels, trans_nlayers) for _ in range(num_trans)]
+            )
+        if use_invertible_transforms:
+            invertible_cfg_data = invertible_cfg or default_invertible_cfg()
+            transforms.extend(make_invertible_family(ts_channels, invertible_cfg_data))
+        if use_group_transforms:
+            group_cfg_data = group_cfg or default_group_cfg()
+            transforms.extend(make_group_family(ts_channels, group_cfg_data))
+        if use_freq_ortho_transforms:
+            freq_cfg_data = freq_cfg or default_freq_cfg()
+            transforms.extend(make_freq_family(ts_channels, freq_cfg_data))
         if transform_families:
             for family in transform_families:
                 transforms.extend(family)
+        if not transforms:
+            raise ValueError('At least one transform must be configured for NeutralAD')
         self.transform_bank = TransformBank(transforms)
         self.num_trans = len(self.transform_bank)
         config = dict(
