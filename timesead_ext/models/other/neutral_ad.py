@@ -36,6 +36,8 @@ from timesead_ext.models.transforms import (
     make_invertible_family,
 )
 from timesead_ext.models.encoders import ITransformerEncoder, PatchTSTEncoder
+from timesead_ext.models.pooling import AttnPool, MeanMaxPool, MeanPool
+from timesead_ext.models.projection import LinearHead, MLPHead
 
 
 class ResTrans1DBlock(torch.nn.Module):
@@ -237,6 +239,7 @@ class NeutralAD(BaseModel):
         self.transform_bank = TransformBank(transforms)
         self.num_trans = len(self.transform_bank)
         self.proj = nn.Identity()
+        self.pooler: Optional[nn.Module] = None
         if encoder_type == "base":
             config = dict(
                 enc_nlayers=enc_nlayers,
@@ -251,31 +254,43 @@ class NeutralAD(BaseModel):
         else:
             encoder_cfg = encoder_cfg or {}
             proj_cfg = proj_cfg or {}
+            if pooling == "base":
+                encoder_pooling = encoder_cfg.pop("pooling", "mean")
+            else:
+                encoder_pooling = "base"
             if encoder_type == "patchtst":
-                encoder = PatchTSTEncoder(seq_len=seq_len, pooling=pooling, **encoder_cfg)
+                encoder = PatchTSTEncoder(seq_len=seq_len, pooling=encoder_pooling, **encoder_cfg)
             elif encoder_type == "itransformer":
-                encoder = ITransformerEncoder(seq_len=seq_len, pooling=pooling, **encoder_cfg)
+                encoder = ITransformerEncoder(seq_len=seq_len, pooling=encoder_pooling, **encoder_cfg)
             else:
                 raise ValueError(f"Unknown encoder_type: {encoder_type}")
             self.enc = nn.ModuleList([encoder])
-            self.proj = self._make_proj_head(encoder.d_model, latent_dim, proj_head, proj_cfg)
+            if pooling != "base":
+                self.pooler = self._make_pooler(pooling, encoder.d_model)
+            proj_head_name = "linear" if proj_head == "base" else proj_head
+            self.proj = self._make_proj_head(encoder.d_model, latent_dim, proj_head_name, proj_cfg)
 
     @staticmethod
     def _make_proj_head(input_dim: int, output_dim: int, proj_head: str, proj_cfg: Dict[str, object]) -> nn.Module:
         if proj_head in {"identity", "none"}:
             return nn.Identity()
         if proj_head == "linear":
-            return nn.Linear(input_dim, output_dim, **proj_cfg)
+            return LinearHead(input_dim, output_dim, **proj_cfg)
         if proj_head == "mlp":
-            hidden_dim = int(proj_cfg.get("hidden_dim", input_dim))
+            hidden_dim = proj_cfg.get("hidden_dim")
             dropout = float(proj_cfg.get("dropout", 0.0))
-            return nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, output_dim),
-            )
+            return MLPHead(input_dim, output_dim, hidden_dim=hidden_dim, dropout=dropout)
         raise ValueError(f"Unknown proj_head: {proj_head}")
+
+    @staticmethod
+    def _make_pooler(pooling: str, d_model: int) -> nn.Module:
+        if pooling == "mean":
+            return MeanPool()
+        if pooling == "meanmax":
+            return MeanMaxPool(d_model)
+        if pooling == "attn":
+            return AttnPool(d_model)
+        raise ValueError(f"Unknown pooling: {pooling}")
 
     def forward(self, inputs: Tuple[torch.Tensor, ...]) -> torch.Tensor:
         x, = inputs
@@ -294,6 +309,8 @@ class NeutralAD(BaseModel):
 
         x_cat = torch.cat([x.unsqueeze(1), x_t], 1)
         zs = self.enc[0](x_cat.reshape(-1, x.shape[1], x.shape[2]))
+        if self.pooler is not None:
+            zs = self.pooler(zs)
         zs = self.proj(zs)
         zs = zs.reshape(x.shape[0], self.num_trans + 1, self.z_dim)
 
