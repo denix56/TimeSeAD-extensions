@@ -66,4 +66,6 @@ class ITransformerEncoder(nn.Module):
         tokens = self.dropout(tokens)
         for block in self.blocks:
             tokens, _ = block(tokens)
+        if self.pooling == "base":
+            return tokens
         return _pool_tokens(tokens, self.pooling)

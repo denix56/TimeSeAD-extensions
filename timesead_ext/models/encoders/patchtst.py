@@ -87,6 +87,9 @@ class PatchTSTEncoder(nn.Module):
         for block in self.blocks:
             tokens, _ = block(tokens)
 
+        if self.pooling == "base":
+            return tokens.reshape(bsz, channels * num_patches, self.d_model)
+
         pooled_patches = _pool_tokens(tokens, self.pooling)
         pooled_patches = pooled_patches.reshape(bsz, channels, self.d_model)
         pooled_channels = _pool_tokens(pooled_patches, self.pooling)
