@@ -108,7 +108,7 @@ class FreqTransform(Transform):
         return output
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        freq = torch.fft.rfft(x, dim=-1)
+        freq = torch.fft.rfft(x.contiguous())
         torch._check(
             freq.shape[-1] == self._freq_bins,
             f"Input frequency bins changed from {self._freq_bins} to {freq.shape[-1]}. "
@@ -119,7 +119,7 @@ class FreqTransform(Transform):
         else:
             mixed = self._mix_freq_blocks(freq)
 
-        return torch.fft.irfft(mixed, n=x.shape[-1], dim=-1)
+        return torch.fft.irfft(mixed.contiguous(), n=x.shape[-1])
 
 
 def make_freq_family(channels: int, seq_len: int, cfg: Dict[str, Any]) -> List[FreqTransform]:
