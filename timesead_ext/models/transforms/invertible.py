@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Any
 
 import torch
 import torch.nn as nn
@@ -52,7 +52,7 @@ class AffineCoupling(nn.Module):
         x1, x2 = x.split([self.c1, self.c2], dim=1)
         return x1, x2
 
-    def _condition(self, cond: torch.Tensor) -> torch.Tensor:
+    def _condition(self, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         scale_shift = self.net(cond)
         scale, shift = scale_shift.chunk(2, dim=1)
         scale = self.clamp * torch.tanh(scale)
@@ -106,7 +106,7 @@ class InvertibleFlow(Transform):
         return y
 
 
-def make_invertible_family(channels: int, cfg: Dict[str, object]) -> List[InvertibleFlow]:
+def make_invertible_family(channels: int, cfg: Dict[str, Any]) -> List[InvertibleFlow]:
     num_flows = int(cfg["num_flows"])
     hidden = int(cfg["hidden"])
     kernel_size = int(cfg["kernel_size"])

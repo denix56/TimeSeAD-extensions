@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Dict, List
+from typing import Dict, List, Any
 
 import torch
 import torch.nn as nn
@@ -36,7 +36,7 @@ def _cayley(skew: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 class FreqTransform(Transform):
-    def __init__(self, channels: int, cfg: Dict[str, object]):
+    def __init__(self, channels: int, cfg: Dict[str, Any]):
         super().__init__()
         self.channels = channels
         self.mode = str(cfg.get("mode", "channel")).lower()
@@ -120,7 +120,7 @@ class FreqTransform(Transform):
         return torch.fft.irfft(mixed, n=x.shape[-1], dim=-1)
 
 
-def make_freq_family(channels: int, cfg: Dict[str, object]) -> List[FreqTransform]:
+def make_freq_family(channels: int, cfg: Dict[str, Any]) -> List[FreqTransform]:
     k_freq = int(cfg.get("k_freq", 1))
     if k_freq < 1:
         raise ValueError("k_freq must be >= 1")

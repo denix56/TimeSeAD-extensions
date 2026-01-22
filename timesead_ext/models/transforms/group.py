@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Tuple, Any
 
 import torch
 import torch.nn as nn
@@ -50,7 +50,7 @@ def _range_bounds(range_value: float | Iterable[float], center: float) -> Tuple[
 
 
 class GroupTransform(Transform):
-    def __init__(self, channels: int, cfg: Dict[str, object]):
+    def __init__(self, channels: int, cfg: Dict[str, Any]):
         super().__init__()
         self.channels = channels
         self.enable_shift = bool(cfg.get("enable_shift", True))
@@ -139,7 +139,7 @@ class GroupTransform(Transform):
         return self._apply_scale_bias(x)
 
 
-def make_group_family(channels: int, cfg: Dict[str, object]) -> List[GroupTransform]:
+def make_group_family(channels: int, cfg: Dict[str, Any]) -> List[GroupTransform]:
     k_group = int(cfg.get("k_group", 1))
     if k_group < 1:
         raise ValueError("k_group must be >= 1")
