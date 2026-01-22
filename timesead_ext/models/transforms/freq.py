@@ -79,7 +79,7 @@ class FreqTransform(Transform):
     def _mix_channels(self, x_freq: torch.Tensor) -> torch.Tensor:
         assert self.raw_skew is not None
         skew = self.raw_skew - self.raw_skew.transpose(-1, -2)
-        ortho = _cayley(skew, self.eps)
+        ortho = _cayley(skew, self.eps).to(dtype=x_freq.dtype)
         freq_t = x_freq.permute(0, 2, 1)
         mixed = torch.einsum("fij,bfj->bfi", ortho, freq_t)
         return mixed.permute(0, 2, 1)
@@ -87,7 +87,7 @@ class FreqTransform(Transform):
     def _mix_freq_blocks(self, x_freq: torch.Tensor) -> torch.Tensor:
         assert self.raw_skew is not None
         skew = self.raw_skew - self.raw_skew.transpose(-1, -2)
-        ortho = _cayley(skew, self.eps)
+        ortho = _cayley(skew, self.eps).to(dtype=x_freq.dtype)
 
         batch, channels, freq_bins = x_freq.shape
         block_count = ortho.shape[1]
