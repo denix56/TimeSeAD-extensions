@@ -15,7 +15,7 @@ def freq_cfg(
     freq_block: int = 8,
     init_identity: bool = True,
     eps: float = 1e-5,
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     return {
         "k_freq": k_freq,
         "mode": mode,
@@ -36,14 +36,17 @@ def _cayley(skew: torch.Tensor, eps: float) -> torch.Tensor:
 
 
 class FreqTransform(Transform):
-    def __init__(self, channels: int, cfg: Dict[str, Any]):
+    def __init__(self, channels: int, seq_len: int, cfg: Dict[str, Any]):
         super().__init__()
         self.channels = channels
+        self.seq_len = int(seq_len)
         self.mode = str(cfg.get("mode", "channel")).lower()
         self.freq_block = int(cfg.get("freq_block", 8))
         self.init_identity = bool(cfg.get("init_identity", True))
         self.eps = float(cfg.get("eps", 1e-5))
 
+        if self.seq_len < 1:
+            raise ValueError("seq_len must be >= 1")
         if self.freq_block < 1:
             raise ValueError("freq_block must be >= 1")
         if self.mode not in {"channel", "freq"}:
@@ -51,8 +54,14 @@ class FreqTransform(Transform):
 
         self.raw_skew: nn.Parameter | None = None
         self._freq_bins: int | None = None
+        freq_bins = self._freq_bins_from_seq_len(self.seq_len)
+        self._init_params(freq_bins)
 
-    def _init_params(self, freq_bins: int, device: torch.device, dtype: torch.dtype) -> None:
+    @staticmethod
+    def _freq_bins_from_seq_len(seq_len: int) -> int:
+        return seq_len // 2 + 1
+
+    def _init_params(self, freq_bins: int) -> None:
         if self.mode == "channel":
             shape = (freq_bins, self.channels, self.channels)
         else:
@@ -60,22 +69,12 @@ class FreqTransform(Transform):
             shape = (self.channels, block_count, self.freq_block, self.freq_block)
 
         if self.init_identity:
-            param = torch.zeros(shape, device=device, dtype=dtype)
+            param = torch.zeros(shape)
         else:
-            param = 0.01 * torch.randn(shape, device=device, dtype=dtype)
+            param = 0.01 * torch.randn(shape)
 
         self.raw_skew = nn.Parameter(param)
         self._freq_bins = freq_bins
-
-    def _ensure_params(self, freq_bins: int, device: torch.device, dtype: torch.dtype) -> None:
-        if self.raw_skew is None:
-            self._init_params(freq_bins, device, dtype)
-            return
-        if self._freq_bins != freq_bins:
-            raise ValueError(
-                f"Input frequency bins changed from {self._freq_bins} to {freq_bins}. "
-                "Recreate the transform for a new input length."
-            )
 
     def _mix_channels(self, x_freq: torch.Tensor) -> torch.Tensor:
         assert self.raw_skew is not None
@@ -110,8 +109,11 @@ class FreqTransform(Transform):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         freq = torch.fft.rfft(x, dim=-1)
-        self._ensure_params(freq.shape[-1], freq.device, freq.dtype)
-
+        torch._check(
+            freq.shape[-1] == self._freq_bins,
+            f"Input frequency bins changed from {self._freq_bins} to {freq.shape[-1]}. "
+            "Recreate the transform for a new input length.",
+        )
         if self.mode == "channel":
             mixed = self._mix_channels(freq)
         else:
@@ -120,8 +122,8 @@ class FreqTransform(Transform):
         return torch.fft.irfft(mixed, n=x.shape[-1], dim=-1)
 
 
-def make_freq_family(channels: int, cfg: Dict[str, Any]) -> List[FreqTransform]:
+def make_freq_family(channels: int, seq_len: int, cfg: Dict[str, Any]) -> List[FreqTransform]:
     k_freq = int(cfg.get("k_freq", 1))
     if k_freq < 1:
         raise ValueError("k_freq must be >= 1")
-    return [FreqTransform(channels, cfg) for _ in range(k_freq)]
+    return [FreqTransform(channels, seq_len, cfg) for _ in range(k_freq)]
