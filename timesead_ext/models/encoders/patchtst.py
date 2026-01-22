@@ -17,10 +17,18 @@ def _pool_tokens(x: torch.Tensor, pooling: str) -> torch.Tensor:
     raise ValueError(f"Unknown pooling: {pooling}")
 
 
+def _compute_padded_len(seq_len: int, patch_len: int, patch_stride: int) -> int:
+    if seq_len < patch_len:
+        return patch_len
+    remainder = (seq_len - patch_len) % patch_stride
+    if remainder == 0:
+        return seq_len
+    return seq_len + (patch_stride - remainder)
+
+
 def _compute_num_patches(seq_len: int, patch_len: int, patch_stride: int) -> int:
-    if seq_len <= patch_len:
-        return 1
-    return ((seq_len - patch_len) // patch_stride) + 1
+    padded_len = _compute_padded_len(seq_len, patch_len, patch_stride)
+    return ((padded_len - patch_len) // patch_stride) + 1
 
 
 def _pad_for_patching(x: torch.Tensor, patch_len: int, patch_stride: int) -> torch.Tensor:
