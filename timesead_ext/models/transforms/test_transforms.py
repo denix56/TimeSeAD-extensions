@@ -16,7 +16,7 @@ def test_output_shapes_and_gradients() -> None:
     flow_cfg = invertible_cfg(num_flows=2, hidden=8, kernel_size=3, clamp=2.0)
     transforms = [
         GroupTransform(channels=3, cfg=group_cfg()),
-        FreqTransform(channels=3, cfg=freq_cfg(mode="channel", freq_block=4)),
+        FreqTransform(channels=3, seq_len=16, cfg=freq_cfg(mode="channel", freq_block=4)),
         InvertibleFlow(
             channels=3,
             num_flows=int(flow_cfg["num_flows"]),
@@ -61,7 +61,7 @@ def test_invertible_round_trip() -> None:
 
 def test_freq_transform_preserves_energy() -> None:
     x = _make_input(batch=4, channels=3, length=32)
-    transform = FreqTransform(channels=3, cfg=freq_cfg(mode="channel", freq_block=4))
+    transform = FreqTransform(channels=3, seq_len=32, cfg=freq_cfg(mode="channel", freq_block=4))
 
     y = transform(x)
 

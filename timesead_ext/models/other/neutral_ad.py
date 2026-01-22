@@ -362,7 +362,7 @@ class NeutralAD(BaseModel):
             transforms.extend(make_group_family(ts_channels, group_cfg_data))
         if use_freq_ortho_transforms:
             freq_cfg_data = freq_cfg or default_freq_cfg()
-            transforms.extend(make_freq_family(ts_channels, freq_cfg_data))
+            transforms.extend(make_freq_family(ts_channels, seq_len, freq_cfg_data))
         if transform_families:
             for family in transform_families:
                 transforms.extend(family)
