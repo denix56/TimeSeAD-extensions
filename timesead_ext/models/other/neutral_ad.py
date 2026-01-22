@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Tuple
+from typing import Optional, Sequence, Tuple
 
 import math
 import torch
@@ -25,6 +25,7 @@ from timesead.models.common import AnomalyDetector
 from timesead.models import BaseModel
 from timesead.optim.loss import Loss
 from timesead.utils.utils import pack_tuple
+from timesead_ext.models.transforms import Transform, TransformBank
 
 
 class ResTrans1DBlock(torch.nn.Module):
@@ -59,7 +60,7 @@ class ConvLayer(nn.Module):
         return out
 
 
-class SeqTransformNet(nn.Module):
+class SeqTransformNet(Transform):
     def __init__(self, x_dim: int, hdim: int, num_layers: int):
         super().__init__()
         self.relu = nn.ReLU()
@@ -169,7 +170,6 @@ def make_seq_nets(x_dim: int, config: dict):
     enc_hdim = config['enc_hdim']
     z_dim = config['latent_dim']
     x_len = config['x_length']
-    trans_nlayers = config['trans_nlayers']
     num_trans = config['num_trans']
     batch_norm = config['batch_norm']
 
@@ -177,47 +177,48 @@ def make_seq_nets(x_dim: int, config: dict):
         SeqEncoder(x_dim, x_len, enc_hdim, z_dim, config['enc_bias'], enc_nlayers, batch_norm)
         for _ in range(num_trans + 1)
     ])
-    trans = nn.ModuleList([
-        SeqTransformNet(x_dim, x_dim, trans_nlayers) for _ in range(num_trans)
-    ])
-
-    return enc, trans
+    return enc
 
 
 class NeutralAD(BaseModel):
     def __init__(self, ts_channels: int, seq_len: int, num_trans: int = 4, trans_type: str = 'residual',
                  enc_hdim: int = 32, enc_nlayers: int = 4, trans_nlayers: int = 4, latent_dim: int = 32,
-                 batch_norm: bool = False, enc_bias: bool = False):
+                 batch_norm: bool = False, enc_bias: bool = False,
+                 transform_families: Optional[Sequence[Sequence[Transform]]] = None):
         super().__init__()
 
         assert num_trans > 1, 'num_trans must be > 1'
-        self.num_trans = num_trans
         self.trans_type = trans_type
         self.z_dim = latent_dim
+        transforms = [SeqTransformNet(ts_channels, ts_channels, trans_nlayers) for _ in range(num_trans)]
+        if transform_families:
+            for family in transform_families:
+                transforms.extend(family)
+        self.transform_bank = TransformBank(transforms)
+        self.num_trans = len(self.transform_bank)
         config = dict(
             enc_nlayers=enc_nlayers,
             enc_hdim=enc_hdim,
             latent_dim=latent_dim,
             x_length=seq_len,
-            trans_nlayers=trans_nlayers,
-            num_trans=num_trans,
+            num_trans=self.num_trans,
             batch_norm=batch_norm,
             enc_bias=enc_bias
         )
-        self.enc, self.trans = make_seq_nets(ts_channels, config)
+        self.enc = make_seq_nets(ts_channels, config)
 
     def forward(self, inputs: Tuple[torch.Tensor, ...]) -> torch.Tensor:
         x, = inputs
         x = x.float()
         x = x.permute(0, 2, 1)
 
-        masks = [self.trans[i](x) for i in range(self.num_trans)]
+        masks = self.transform_bank(x)
         if self.trans_type == 'forward':
-            x_t = torch.stack(masks, dim=1)
+            x_t = masks
         elif self.trans_type == 'mul':
-            x_t = torch.stack([torch.sigmoid(mask) for mask in masks], dim=1) * x.unsqueeze(1)
+            x_t = torch.sigmoid(masks) * x.unsqueeze(1)
         elif self.trans_type == 'residual':
-            x_t = torch.stack(masks, dim=1) + x.unsqueeze(1)
+            x_t = masks + x.unsqueeze(1)
         else:
             raise ValueError(f'Unknown trans_type: {self.trans_type}')
 
