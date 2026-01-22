@@ -15,7 +15,7 @@ def invertible_cfg(
     clamp: float = 2.0,
     share_across_k: bool = False,
     k_invertible: int = 1,
-) -> Dict[str, object]:
+) -> Dict[str, Any]:
     return {
         "num_flows": num_flows,
         "hidden": hidden,

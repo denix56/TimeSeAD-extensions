@@ -14,7 +14,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Any
 
 import math
 import torch
@@ -271,7 +271,7 @@ class NeutralAD(BaseModel):
             self.proj = self._make_proj_head(encoder.d_model, latent_dim, proj_head_name, proj_cfg)
 
     @staticmethod
-    def _make_proj_head(input_dim: int, output_dim: int, proj_head: str, proj_cfg: Dict[str, object]) -> nn.Module:
+    def _make_proj_head(input_dim: int, output_dim: int, proj_head: str, proj_cfg: Dict[str, Any]) -> nn.Module:
         if proj_head in {"identity", "none"}:
             return nn.Identity()
         if proj_head == "linear":
