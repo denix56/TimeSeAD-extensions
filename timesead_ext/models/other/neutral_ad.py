@@ -401,6 +401,8 @@ class NeutralAD(BaseModel):
                 self.pooler = self._make_pooler(pooling, encoder.d_model)
             proj_head_name = "linear" if proj_head == "base" else proj_head
             self.proj = self._make_proj_head(encoder.d_model, latent_dim, proj_head_name, proj_cfg)
+            if proj_head_name in {"identity", "none"}:
+                self.z_dim = encoder.d_model
 
     @staticmethod
     def _make_proj_head(input_dim: int, output_dim: int, proj_head: str, proj_cfg: Dict[str, Any]) -> nn.Module:
