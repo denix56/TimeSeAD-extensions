@@ -24,7 +24,7 @@ def _pad_or_trim(x: torch.Tensor, seq_len: int) -> torch.Tensor:
     if current_len < seq_len:
         pad = seq_len - current_len
         return F.pad(x, (0, pad))
-    return x[..., -seq_len:]
+    return x[..., -seq_len:].contiguous()
 
 
 class ITransformerEncoder(nn.Module):

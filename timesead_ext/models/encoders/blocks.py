@@ -76,7 +76,6 @@ class TransformerBlock(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        attn_weights = None
         if self.norm_first:
             attn_out, attn_weights = self.attn(
                 self.norm1(x),
