@@ -457,7 +457,6 @@ class NeutralAD(BaseModel):
             Tensor of shape (batch, num_transforms + 1, latent_dim).
         """
         x, = inputs
-        x = x.float()
         x = x.permute(0, 2, 1).contiguous()
 
         masks = self.transform_bank(x)
