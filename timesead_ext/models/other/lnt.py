@@ -16,7 +16,7 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-from typing import Tuple
+from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -137,11 +137,17 @@ class LNT(BaseModel):
             transformation_type=transformation_type
         )
 
-    def forward(self, inputs: Tuple[torch.Tensor, ...]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, inputs: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Forward pass returning concatenated embeddings for loss computation.
+
+        Returns a single tensor containing both original and transformed embeddings,
+        which is compatible with TimeSeAD's pack_tuple utility.
+        """
         x, = inputs
         # x shape: (batch, seq_len, channels)
 
         batch_size = x.shape[0]
+        actual_seq_len = x.shape[1]  # Use actual sequence length from input
 
         # Permute to (batch, channels, seq_len) for Conv1d
         x = x.permute(0, 2, 1).float()
@@ -158,12 +164,73 @@ class LNT(BaseModel):
         # Apply transformations
         z_transformed = self.transformation_learner(z_flat)  # (batch * seq_len, n_trans, latent_dim)
 
-        # Reshape back
-        z_transformed = z_transformed.reshape(batch_size, self.seq_len, self.n_transformations, self.latent_dim)
+        # Reshape back using actual sequence length
+        z_transformed = z_transformed.reshape(batch_size, actual_seq_len, self.n_transformations, self.latent_dim)
 
-        # z: (batch, seq_len, latent_dim)
+        # Concatenate z and z_transformed into a single tensor for compatibility with pack_tuple
+        # z: (batch, seq_len, latent_dim) -> (batch, seq_len, 1, latent_dim)
         # z_transformed: (batch, seq_len, n_trans, latent_dim)
-        return z, z_transformed
+        # combined: (batch, seq_len, n_trans + 1, latent_dim)
+        combined = torch.cat([z.unsqueeze(2), z_transformed], dim=2)
+
+        return combined
+
+
+def _lnt_dcl_score(combined: torch.Tensor, temperature: float, eval_mode: bool) -> torch.Tensor:
+    """Compute Deterministic Contrastive Loss score for LNT.
+
+    Args:
+        combined: Tensor of shape (batch, seq_len, n_trans + 1, latent_dim)
+                  where [:, :, 0, :] is the original embedding and
+                  [:, :, 1:, :] are the transformed embeddings
+        temperature: Temperature for softmax scaling
+        eval_mode: If True, return per-sample scores; if False, return mean loss
+
+    Returns:
+        Loss tensor (scalar if eval_mode=False, (batch,) if eval_mode=True)
+    """
+    batch_size, seq_len, n_all, latent_dim = combined.shape
+    n_trans = n_all - 1
+
+    # Flatten batch and seq dimensions
+    # combined_flat: (batch * seq_len, n_trans + 1, latent_dim)
+    combined_flat = combined.reshape(-1, n_all, latent_dim)
+
+    # Normalize for cosine similarity
+    combined_norm = F.normalize(combined_flat, p=2, dim=-1)
+
+    # Compute similarity matrix: (batch*seq_len, n_trans+1, n_trans+1)
+    sim = torch.matmul(combined_norm, combined_norm.transpose(-2, -1)) / temperature
+
+    # Positive pairs: original (index 0) vs each transformation (indices 1:)
+    sim_pos = sim[:, 1:, 0]  # (batch*seq_len, n_trans)
+
+    # Negative pairs: exclude self-similarity (diagonal)
+    diag_mask = torch.eye(n_all, device=combined.device, dtype=torch.bool)
+    sim_masked = sim.masked_fill(diag_mask, float('-inf'))
+
+    # For each transformation, compute logsumexp over all other embeddings
+    # sim_all: (batch*seq_len, n_trans, n_all) -> exclude the transformation's own row
+    sim_for_trans = sim_masked[:, 1:, :]  # (batch*seq_len, n_trans, n_all)
+
+    # Log-sum-exp for normalization
+    normalization_const = torch.logsumexp(sim_for_trans, dim=-1)  # (batch*seq_len, n_trans)
+
+    # DCL loss per position: -log(exp(pos) / sum(exp(all))) = -pos + logsumexp(all)
+    loss_per_position = -sim_pos + normalization_const  # (batch*seq_len, n_trans)
+
+    # Sum over transformations
+    loss_per_timestep = loss_per_position.sum(dim=-1)  # (batch*seq_len,)
+
+    # Reshape to (batch, seq_len)
+    loss_per_sample = loss_per_timestep.reshape(batch_size, seq_len)
+
+    if eval_mode:
+        # Return per-sample anomaly scores (mean over sequence)
+        return loss_per_sample.mean(dim=1)
+    else:
+        # Return scalar loss for training
+        return loss_per_sample.mean()
 
 
 class LNTLoss(Loss):
@@ -173,65 +240,6 @@ class LNTLoss(Loss):
         super().__init__()
         self.temperature = temperature
 
-    @staticmethod
-    def cosine_similarity(x: torch.Tensor, x_: torch.Tensor) -> torch.Tensor:
-        """Compute cosine similarity between tensors."""
-        x = F.normalize(x, p=2, dim=-1)
-        x_ = F.normalize(x_, p=2, dim=-1)
-        return torch.matmul(x, x_.transpose(-2, -1))
-
-    def deterministic_contrastive_loss(
-        self,
-        z: torch.Tensor,
-        z_transformed: torch.Tensor,
-        average: bool = True
-    ) -> torch.Tensor:
-        """
-        Compute DCL loss per timestep.
-
-        Args:
-            z: Original embeddings (batch, seq_len, latent_dim)
-            z_transformed: Transformed embeddings (batch, seq_len, n_trans, latent_dim)
-            average: Whether to average over batch and sequence
-
-        Returns:
-            Loss tensor
-        """
-        batch_size, seq_len, n_trans, latent_dim = z_transformed.shape
-
-        # Flatten batch and seq dimensions
-        z_flat = z.reshape(-1, latent_dim)  # (batch*seq_len, latent_dim)
-        z_trans_flat = z_transformed.reshape(-1, n_trans, latent_dim)  # (batch*seq_len, n_trans, latent_dim)
-
-        # Concatenate original and transformed: (batch*seq_len, n_trans+1, latent_dim)
-        z_all = torch.cat([z_flat.unsqueeze(1), z_trans_flat], dim=1)
-
-        # Compute similarity matrix: (batch*seq_len, n_trans+1, n_trans+1)
-        sim = self.cosine_similarity(z_all, z_all) / self.temperature
-
-        # Positive pairs: original vs each transformation
-        sim_pos = sim[:, 1:, 0]  # (batch*seq_len, n_trans)
-
-        # Negative pairs: exclude self-similarity (diagonal)
-        n_all = n_trans + 1
-        mask = (torch.ones(n_all, n_all, device=z.device) - torch.eye(n_all, device=z.device)).bool()
-        sim_all = torch.masked_select(sim, mask).view(-1, n_all, n_all - 1)[:, 1:, :]  # (batch*seq_len, n_trans, n_all-1)
-
-        # Log-sum-exp for numerical stability
-        normalization_const = torch.logsumexp(sim_all, dim=-1)  # (batch*seq_len, n_trans)
-
-        # DCL loss
-        loss = -torch.sum(sim_pos - normalization_const, dim=-1)  # (batch*seq_len,)
-
-        # Reshape to (batch, seq_len)
-        loss = loss.reshape(batch_size, seq_len)
-
-        if average:
-            return torch.mean(loss)
-        else:
-            # Return per-timestep loss (mean over sequence for each sample)
-            return torch.mean(loss, dim=1)
-
     def forward(
         self,
         predictions: Tuple[torch.Tensor, ...],
@@ -240,23 +248,26 @@ class LNTLoss(Loss):
         *args,
         **kwargs
     ) -> torch.Tensor:
-        z, z_transformed = predictions
-
-        if eval:
-            # Return per-sample anomaly scores
-            return self.deterministic_contrastive_loss(z, z_transformed, average=False)
-        else:
-            # Return scalar loss for training
-            return self.deterministic_contrastive_loss(z, z_transformed, average=True)
+        combined, = predictions  # Unpack single tensor from tuple
+        return _lnt_dcl_score(combined, self.temperature, eval_mode=eval)
 
 
 class LNTAnomalyDetector(AnomalyDetector):
     """Anomaly detector wrapper for LNT."""
 
-    def __init__(self, model: LNT, loss: LNTLoss):
+    def __init__(self, model: LNT, loss: Optional[LNTLoss] = None, temperature: float = 0.5):
+        """Initialize LNT anomaly detector.
+
+        Args:
+            model: The LNT model instance
+            loss: Optional LNTLoss instance. If not provided, creates one internally.
+            temperature: Temperature for DCL if loss is not provided. Default: 0.5
+        """
         super().__init__()
         self.model = model
-        self.loss = loss
+        self.temperature = temperature
+        # Create loss internally if not provided (for compatibility with benchmark framework)
+        self.loss = loss if loss is not None else LNTLoss(temperature=temperature)
 
     def compute_online_anomaly_score(self, inputs: Tuple[torch.Tensor, ...]) -> torch.Tensor:
         with torch.inference_mode():
