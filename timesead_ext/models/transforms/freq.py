@@ -111,8 +111,7 @@ class FreqTransform(Transform):
         freq = torch.fft.rfft(x.contiguous())
         torch._check(
             freq.shape[-1] == self._freq_bins,
-            f"Input frequency bins changed from {self._freq_bins} to {freq.shape[-1]}. "
-            "Recreate the transform for a new input length.",
+            f"Input frequency bins changed. Recreate the transform for a new input length.",
         )
         if self.mode == "channel":
             mixed = self._mix_channels(freq)
