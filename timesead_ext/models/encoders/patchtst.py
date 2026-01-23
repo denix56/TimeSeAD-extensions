@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -92,8 +94,14 @@ class PatchTSTEncoder(nn.Module):
         pos_embed = self.pos_embed[:, :num_patches, :]
         tokens = self.dropout(tokens + pos_embed)
 
-        for block in self.blocks:
-            tokens, _ = block(tokens)
+        # Fix the CUDA assertion error in Flash attention caused when batch_size > 65535
+        tokens_in = torch.tensor_split(tokens, math.ceil(tokens.shape[0] / 65535), dim=0)
+        tokens_out = []
+        for tokens in tokens_in:
+            for block in self.blocks:
+                tokens, _ = block(tokens)
+            tokens_out.append(tokens)
+        tokens = torch.cat(tokens_out, dim=0)
 
         if self.pooling == "base":
             return tokens.reshape(bsz, channels * num_patches, self.d_model)
