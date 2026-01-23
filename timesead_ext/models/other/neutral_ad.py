@@ -458,7 +458,7 @@ class NeutralAD(BaseModel):
         """
         x, = inputs
         x = x.float()
-        x = x.permute(0, 2, 1)
+        x = x.permute(0, 2, 1).contiguous()
 
         masks = self.transform_bank(x)
         if self.trans_type == 'forward':
