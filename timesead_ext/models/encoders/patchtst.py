@@ -94,7 +94,7 @@ class PatchTSTEncoder(nn.Module):
         pos_embed = self.pos_embed[:, :num_patches, :]
         tokens = self.dropout(tokens + pos_embed)
 
-        # Fix the CUDA assertion error in Flash attention caused when batch_size > 65535
+        # Fix the CUDA assertion error in Flash attention caused when batch_size > 65,535
         tokens_in = torch.tensor_split(tokens, math.ceil(tokens.shape[0] / 65535), dim=0)
         tokens_out = []
         for tokens in tokens_in:
