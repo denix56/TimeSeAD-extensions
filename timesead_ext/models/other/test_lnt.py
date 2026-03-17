@@ -6,9 +6,11 @@ import torch.nn.functional as F
 from timesead_ext.models.other.lnt import (
     BoschCPCEncoder,
     LNT,
+    LNTAnomalyDetector,
     LNTLoss,
+    ModernTCNTimeEncoder,
     NeuralTransformationLearner,
-    PatchTSTTimeEncoder,
+    SensorformerTimeEncoder,
     VectorizedTransformationBank,
 )
 
@@ -20,7 +22,7 @@ def _assert_forward_and_backward(model: LNT, batch: int, channels: int, length: 
 
     assert combined.shape == (batch, length, model.n_transformations + 1, model.latent_dim)
 
-    loss = LNTLoss()( (combined,) )
+    loss = LNTLoss()((combined,))
     loss.backward()
 
     assert x.grad is not None
@@ -45,21 +47,6 @@ def _legacy_lnt_dcl_score(combined: torch.Tensor, temperature: float, eval_mode:
     if eval_mode:
         return loss_per_sample.mean(dim=1)
     return loss_per_sample.mean()
-
-
-def _score_map(combined: torch.Tensor, temperature: float = 0.5) -> torch.Tensor:
-    batch_size, seq_len, n_all, latent_dim = combined.shape
-    n_trans = n_all - 1
-    flat = combined.reshape(-1, n_all, latent_dim)
-    norm = F.normalize(flat, p=2, dim=-1)
-    z_ori = norm[:, :1, :]
-    z_trans = norm[:, 1:, :]
-    sim_pos = torch.sum(z_trans * z_ori, dim=-1) / temperature
-    logits = torch.matmul(z_trans, norm.transpose(-2, -1)) / temperature
-    diag = torch.eye(n_trans, device=combined.device, dtype=torch.bool)
-    logits = logits.clone()
-    logits[..., 1:].masked_fill_(diag.unsqueeze(0), float("-inf"))
-    return (-sim_pos + torch.logsumexp(logits, dim=-1)).sum(dim=-1).reshape(batch_size, seq_len)
 
 
 def _make_sine_batch(batch: int, length: int, channels: int) -> torch.Tensor:
@@ -88,7 +75,19 @@ def test_lnt_forward_backward_all_backbones() -> None:
     models = [
         LNT(encoder_type="cnn", **common),
         LNT(
-            encoder_type="patchtst_time",
+            encoder_type="modern_tcn",
+            encoder_cfg={
+                "d_model": 24,
+                "num_layers": 2,
+                "kernel_sizes": [5, 7],
+                "dilations": [1, 2],
+                "ff_mult": 2,
+                "dropout": 0.0,
+            },
+            **common,
+        ),
+        LNT(
+            encoder_type="sensorformer_time",
             encoder_cfg={
                 "patch_len": 8,
                 "patch_stride": 4,
@@ -97,6 +96,8 @@ def test_lnt_forward_backward_all_backbones() -> None:
                 "num_layers": 1,
                 "d_ff": 32,
                 "dropout": 0.0,
+                "global_patches": 6,
+                "attention_chunk_size": None,
             },
             **common,
         ),
@@ -117,8 +118,29 @@ def test_lnt_forward_backward_all_backbones() -> None:
         _assert_forward_and_backward(model, batch, channels, length)
 
 
-def test_patchtst_time_encoder_preserves_sequence_length() -> None:
-    encoder = PatchTSTTimeEncoder(
+def test_modern_tcn_encoder_preserves_sequence_length() -> None:
+    encoder = ModernTCNTimeEncoder(
+        input_channels=3,
+        latent_dim=12,
+        d_model=16,
+        num_layers=2,
+        kernel_sizes=(7, 11),
+        dilations=(1, 3),
+        ff_mult=2,
+        dropout=0.0,
+    )
+
+    x = torch.randn(2, 3, 37, requires_grad=True)
+    y = encoder(x)
+    assert y.shape == (2, 37, 12)
+
+    y.pow(2).mean().backward()
+    assert x.grad is not None
+    assert torch.isfinite(x.grad).all()
+
+
+def test_sensorformer_time_encoder_preserves_sequence_length() -> None:
+    encoder = SensorformerTimeEncoder(
         input_channels=3,
         seq_len=64,
         latent_dim=12,
@@ -129,6 +151,8 @@ def test_patchtst_time_encoder_preserves_sequence_length() -> None:
         num_layers=1,
         d_ff=32,
         dropout=0.0,
+        global_patches=6,
+        attention_chunk_size=None,
     )
 
     x = torch.randn(2, 3, 37, requires_grad=True)
@@ -192,13 +216,57 @@ def test_optimized_lnt_loss_matches_legacy_formula() -> None:
     assert torch.allclose(actual_eval, expected_eval, atol=1e-6, rtol=1e-6)
 
 
-def test_lnt_synthetic_localization_smoke() -> None:
+def test_training_loss_still_averages_over_all_timesteps() -> None:
     torch.manual_seed(0)
-    batch, channels, length = 6, 3, 48
+    combined = torch.randn(4, 11, 5, 7)
+    loss = LNTLoss(temperature=0.4)
+
+    score_map = loss.per_timestep_scores((combined,))
+    expected = score_map.mean()
+    last_only = score_map[:, -1].mean()
+    actual = loss((combined,))
+
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+    assert not torch.isclose(actual, last_only, atol=1e-4, rtol=1e-4)
+
+
+def test_detector_returns_last_timestep_score() -> None:
+    torch.manual_seed(0)
+    model = LNT(
+        ts_channels=3,
+        seq_len=24,
+        n_transformations=4,
+        hidden_dim=16,
+        latent_dim=12,
+        encoder_type="modern_tcn",
+        encoder_cfg={
+            "d_model": 16,
+            "num_layers": 2,
+            "kernel_sizes": [5, 7],
+            "dilations": [1, 2],
+            "ff_mult": 2,
+            "dropout": 0.0,
+        },
+        transform_cfg={"hidden_dim": 16, "dropout": 0.0},
+    )
+    detector = LNTAnomalyDetector(model)
+    x = torch.randn(5, 24, 3)
+
+    with torch.no_grad():
+        combined = model((x,))
+        expected = detector.loss.per_timestep_scores((combined,))[:, -1]
+
+    actual = detector.compute_online_anomaly_score((x,))
+    assert actual.shape == (5,)
+    assert torch.allclose(actual, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_lnt_last_step_detector_smoke() -> None:
+    torch.manual_seed(0)
+    batch, channels, length = 8, 3, 48
     clean = _make_sine_batch(batch, length, channels)
     anomalous = clean.clone()
-    anomaly_noise = 0.75 * torch.randn(batch, 8, channels)
-    anomalous[:, 20:28, :] = anomalous[:, 20:28, :] + 1.5 + anomaly_noise
+    anomalous[:, -1, :] = anomalous[:, -1, :] + 3.5
 
     model = LNT(
         ts_channels=channels,
@@ -206,23 +274,23 @@ def test_lnt_synthetic_localization_smoke() -> None:
         n_transformations=4,
         hidden_dim=24,
         latent_dim=12,
-        encoder_type="patchtst_time",
+        encoder_type="modern_tcn",
         encoder_cfg={
-            "patch_len": 8,
-            "patch_stride": 4,
             "d_model": 16,
-            "num_heads": 2,
-            "num_layers": 1,
-            "d_ff": 32,
+            "num_layers": 2,
+            "kernel_sizes": [5, 7],
+            "dilations": [1, 2],
+            "ff_mult": 2,
             "dropout": 0.0,
         },
         transform_cfg={"hidden_dim": 16, "dropout": 0.0},
     )
     loss = LNTLoss()
+    detector = LNTAnomalyDetector(model, loss=loss)
     optimizer = torch.optim.Adam(model.parameters(), lr=5e-3)
 
     model.train()
-    for _ in range(12):
+    for _ in range(10):
         optimizer.zero_grad(set_to_none=True)
         combined = model((clean,))
         train_loss = loss((combined,))
@@ -231,11 +299,7 @@ def test_lnt_synthetic_localization_smoke() -> None:
 
     model.eval()
     with torch.no_grad():
-        clean_scores = _score_map(model((clean,)))
-        anomaly_scores = _score_map(model((anomalous,)))
+        clean_scores = detector.compute_online_anomaly_score((clean,))
+        anomaly_scores = detector.compute_online_anomaly_score((anomalous,))
 
-    clean_region = anomaly_scores[:, :16].mean()
-    anomaly_region = anomaly_scores[:, 20:28].mean()
-    baseline = clean_scores[:, 20:28].mean()
-    assert anomaly_region > clean_region
-    assert anomaly_region > baseline
+    assert anomaly_scores.mean() > clean_scores.mean()

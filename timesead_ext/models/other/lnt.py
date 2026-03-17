@@ -28,11 +28,41 @@ except ModuleNotFoundError as exc:
     def pack_tuple(x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         return (x,)
 
-from timesead_ext.models.encoders.patchtst import (
-    PatchTSTEncoder,
-    _compute_num_patches,
-    _compute_padded_len,
-)
+
+def _compute_padded_len(seq_len: int, patch_len: int, patch_stride: int) -> int:
+    if seq_len < patch_len:
+        return patch_len
+    remainder = (seq_len - patch_len) % patch_stride
+    if remainder == 0:
+        return seq_len
+    return seq_len + (patch_stride - remainder)
+
+
+def _compute_num_patches(seq_len: int, patch_len: int, patch_stride: int) -> int:
+    padded_len = _compute_padded_len(seq_len, patch_len, patch_stride)
+    return ((padded_len - patch_len) // patch_stride) + 1
+
+
+def _pad_for_patching(x: torch.Tensor, patch_len: int, patch_stride: int) -> torch.Tensor:
+    seq_len = x.shape[-1]
+    if seq_len < patch_len:
+        pad = patch_len - seq_len
+    else:
+        remainder = (seq_len - patch_len) % patch_stride
+        pad = 0 if remainder == 0 else patch_stride - remainder
+    if pad == 0:
+        return x
+    return F.pad(x, (0, pad))
+
+
+def _make_mlp(d_model: int, d_ff: int, dropout: float) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(d_model, d_ff),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(d_ff, d_model),
+        nn.Dropout(dropout),
+    )
 
 
 class SimpleEncoder(nn.Module):
@@ -65,8 +95,126 @@ class CNNTimeEncoder(nn.Module):
         return self.encoder(x).transpose(1, 2).contiguous()
 
 
-class PatchTSTTimeEncoder(nn.Module):
-    """PatchTST backbone adapted back to per-timestep latent vectors."""
+class ModernTCNBlock(nn.Module):
+    def __init__(self, d_model: int, kernel_size: int, dilation: int, ff_mult: int = 4, dropout: float = 0.1):
+        super().__init__()
+        padding = ((kernel_size - 1) * dilation) // 2
+        self.norm = nn.LayerNorm(d_model)
+        self.depthwise_conv = nn.Conv1d(
+            d_model,
+            d_model,
+            kernel_size=kernel_size,
+            padding=padding,
+            dilation=dilation,
+            groups=d_model,
+        )
+        hidden_dim = ff_mult * d_model
+        self.expand = nn.Linear(d_model, hidden_dim)
+        self.contract = nn.Linear(hidden_dim, d_model)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.norm(x)
+        y = self.depthwise_conv(y.transpose(1, 2)).transpose(1, 2).contiguous()
+        y = self.expand(y)
+        y = self.activation(y)
+        y = self.dropout(y)
+        y = self.contract(y)
+        y = self.dropout(y)
+        return x + y
+
+
+class ModernTCNTimeEncoder(nn.Module):
+    """ModernTCN-style backbone that preserves one latent vector per timestep."""
+
+    def __init__(
+        self,
+        input_channels: int,
+        latent_dim: int,
+        d_model: int = 128,
+        num_layers: int = 4,
+        kernel_sizes: Sequence[int] = (7, 7, 15, 15),
+        dilations: Sequence[int] = (1, 2, 4, 8),
+        ff_mult: int = 4,
+        dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        if len(kernel_sizes) != num_layers or len(dilations) != num_layers:
+            raise ValueError("kernel_sizes and dilations must match num_layers")
+
+        self.stem = nn.Conv1d(input_channels, d_model, kernel_size=3, padding=1)
+        self.blocks = nn.ModuleList(
+            [
+                ModernTCNBlock(
+                    d_model=d_model,
+                    kernel_size=int(kernel_size),
+                    dilation=int(dilation),
+                    ff_mult=ff_mult,
+                    dropout=dropout,
+                )
+                for kernel_size, dilation in zip(kernel_sizes, dilations)
+            ]
+        )
+        self.output_norm = nn.LayerNorm(d_model)
+        self.output_proj = nn.Linear(d_model, latent_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.stem(x).transpose(1, 2).contiguous()
+        for block in self.blocks:
+            y = block(y)
+        return self.output_proj(self.output_norm(y))
+
+
+class SensorformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        dropout: float = 0.1,
+        attention_chunk_size: Optional[int] = None,
+    ) -> None:
+        super().__init__()
+        self.attention_chunk_size = attention_chunk_size
+        self.time_norm1 = nn.LayerNorm(d_model)
+        self.time_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.time_norm2 = nn.LayerNorm(d_model)
+        self.time_ffn = _make_mlp(d_model, d_ff, dropout)
+
+        self.var_norm1 = nn.LayerNorm(d_model)
+        self.var_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.var_norm2 = nn.LayerNorm(d_model)
+        self.var_ffn = _make_mlp(d_model, d_ff, dropout)
+        self.dropout = nn.Dropout(dropout)
+
+    def _run_attention(self, attn: nn.MultiheadAttention, tokens: torch.Tensor) -> torch.Tensor:
+        if self.attention_chunk_size is None or tokens.shape[0] <= self.attention_chunk_size:
+            return attn(tokens, tokens, tokens, need_weights=False)[0]
+
+        outputs = []
+        for token_chunk in torch.split(tokens, self.attention_chunk_size, dim=0):
+            outputs.append(attn(token_chunk, token_chunk, token_chunk, need_weights=False)[0])
+        return torch.cat(outputs, dim=0)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, global_patches, d_model = x.shape
+
+        time_tokens = x.reshape(batch_size * channels, global_patches, d_model)
+        attn_out = self._run_attention(self.time_attn, self.time_norm1(time_tokens))
+        time_tokens = time_tokens + self.dropout(attn_out)
+        time_tokens = time_tokens + self.time_ffn(self.time_norm2(time_tokens))
+        x = time_tokens.reshape(batch_size, channels, global_patches, d_model)
+
+        variable_tokens = x.permute(0, 2, 1, 3).reshape(batch_size * global_patches, channels, d_model)
+        attn_out = self._run_attention(self.var_attn, self.var_norm1(variable_tokens))
+        variable_tokens = variable_tokens + self.dropout(attn_out)
+        variable_tokens = variable_tokens + self.var_ffn(self.var_norm2(variable_tokens))
+        return variable_tokens.reshape(batch_size, global_patches, channels, d_model).permute(0, 2, 1, 3).contiguous()
+
+
+class SensorformerTimeEncoder(nn.Module):
+    """Sensorformer-style patch transformer adapted back to per-timestep latents."""
 
     def __init__(
         self,
@@ -80,7 +228,8 @@ class PatchTSTTimeEncoder(nn.Module):
         num_layers: int = 3,
         d_ff: int = 256,
         dropout: float = 0.1,
-        token_chunk_size: int | None = None,
+        global_patches: int = 16,
+        attention_chunk_size: Optional[int] = 4096,
     ) -> None:
         super().__init__()
         self.input_channels = input_channels
@@ -89,57 +238,49 @@ class PatchTSTTimeEncoder(nn.Module):
         self.patch_stride = patch_stride
         self.d_model = d_model
         self.latent_dim = latent_dim
-        self.patch_encoder = PatchTSTEncoder(
-            seq_len=seq_len,
-            patch_len=patch_len,
-            patch_stride=patch_stride,
-            d_model=d_model,
-            num_heads=num_heads,
-            num_layers=num_layers,
-            d_ff=d_ff,
-            dropout=dropout,
-            pooling="base",
-            token_chunk_size=token_chunk_size,
+        self.max_patches = _compute_num_patches(seq_len, patch_len, patch_stride)
+        self.max_global_patches = min(int(global_patches), self.max_patches)
+
+        self.patch_proj = nn.Linear(patch_len, d_model)
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.max_patches, d_model))
+        self.dropout = nn.Dropout(dropout)
+        self.compress_weight = nn.Parameter(torch.empty(self.max_global_patches, self.max_patches))
+        self.compress_bias = nn.Parameter(torch.zeros(self.max_global_patches))
+        self.expand_weight = nn.Parameter(torch.empty(self.max_patches, self.max_global_patches))
+        self.expand_bias = nn.Parameter(torch.zeros(self.max_patches))
+        self.blocks = nn.ModuleList(
+            [
+                SensorformerBlock(
+                    d_model=d_model,
+                    num_heads=num_heads,
+                    d_ff=d_ff,
+                    dropout=dropout,
+                    attention_chunk_size=attention_chunk_size,
+                )
+                for _ in range(num_layers)
+            ]
         )
         self.patch_to_time = nn.Linear(d_model, patch_len * d_model)
         self.channel_norm = nn.LayerNorm(d_model)
         self.channel_fuse = nn.Linear(input_channels * d_model, latent_dim)
         self.output_norm = nn.LayerNorm(latent_dim)
+        self.reset_parameters()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        batch_size, channels, actual_len = x.shape
-        if channels != self.input_channels:
-            raise ValueError(f"Expected {self.input_channels} channels, got {channels}")
+    def reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.compress_weight)
+        nn.init.xavier_uniform_(self.expand_weight)
 
-        num_patches = _compute_num_patches(actual_len, self.patch_len, self.patch_stride)
-        max_patches = self.patch_encoder.pos_embed.shape[1]
-        if num_patches > max_patches:
-            raise ValueError(
-                f"Input length {actual_len} requires {num_patches} patches, "
-                f"but encoder was initialized for at most {max_patches} patches"
-            )
+    def _compress_patches(self, tokens: torch.Tensor, num_patches: int) -> torch.Tensor:
+        global_patches = min(self.max_global_patches, num_patches)
+        weight = self.compress_weight[:global_patches, :num_patches]
+        bias = self.compress_bias[:global_patches]
+        return torch.einsum("bcpd,gp->bcgd", tokens, weight) + bias.view(1, 1, global_patches, 1)
 
-        patch_tokens = self.patch_encoder(x)
-        patch_tokens = patch_tokens.reshape(batch_size, channels, num_patches, self.d_model)
-
-        patch_values = self.patch_to_time(patch_tokens)
-        padded_len = _compute_padded_len(actual_len, self.patch_len, self.patch_stride)
-        patch_values = patch_values.reshape(batch_size * channels, num_patches, self.d_model * self.patch_len)
-        patch_values = patch_values.transpose(1, 2).contiguous()
-
-        time_tokens = F.fold(
-            patch_values,
-            output_size=(1, padded_len),
-            kernel_size=(1, self.patch_len),
-            stride=(1, self.patch_stride),
-        )
-        counts = self._overlap_counts(num_patches, padded_len, x.device, x.dtype)
-        time_tokens = time_tokens / counts
-        time_tokens = time_tokens.squeeze(2)[..., :actual_len].transpose(1, 2).contiguous()
-        time_tokens = time_tokens.reshape(batch_size, channels, actual_len, self.d_model)
-        time_tokens = self.channel_norm(time_tokens)
-        time_tokens = time_tokens.permute(0, 2, 1, 3).reshape(batch_size, actual_len, channels * self.d_model)
-        return self.output_norm(self.channel_fuse(time_tokens))
+    def _expand_patches(self, tokens: torch.Tensor, num_patches: int) -> torch.Tensor:
+        global_patches = tokens.shape[2]
+        weight = self.expand_weight[:num_patches, :global_patches]
+        bias = self.expand_bias[:num_patches]
+        return torch.einsum("bcgd,pg->bcpd", tokens, weight) + bias.view(1, 1, num_patches, 1)
 
     def _overlap_counts(
         self,
@@ -157,6 +298,47 @@ class PatchTSTTimeEncoder(nn.Module):
         )
         return counts.clamp_min_(1.0)
 
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, actual_len = x.shape
+        if channels != self.input_channels:
+            raise ValueError(f"Expected {self.input_channels} channels, got {channels}")
+
+        num_patches = _compute_num_patches(actual_len, self.patch_len, self.patch_stride)
+        if num_patches > self.max_patches:
+            raise ValueError(
+                f"Input length {actual_len} requires {num_patches} patches, "
+                f"but encoder was initialized for at most {self.max_patches} patches"
+            )
+
+        patches = _pad_for_patching(x, self.patch_len, self.patch_stride)
+        patches = patches.unfold(dimension=-1, size=self.patch_len, step=self.patch_stride)
+        patch_tokens = self.patch_proj(patches)
+        patch_tokens = self.dropout(patch_tokens + self.pos_embed[:, :num_patches, :].unsqueeze(1))
+        patch_tokens = self._compress_patches(patch_tokens, num_patches)
+
+        for block in self.blocks:
+            patch_tokens = block(patch_tokens)
+
+        patch_tokens = self._expand_patches(patch_tokens, num_patches)
+        patch_values = self.patch_to_time(patch_tokens)
+
+        padded_len = _compute_padded_len(actual_len, self.patch_len, self.patch_stride)
+        patch_values = patch_values.reshape(batch_size * channels, num_patches, self.d_model * self.patch_len)
+        patch_values = patch_values.transpose(1, 2).contiguous()
+        time_tokens = F.fold(
+            patch_values,
+            output_size=(1, padded_len),
+            kernel_size=(1, self.patch_len),
+            stride=(1, self.patch_stride),
+        )
+        counts = self._overlap_counts(num_patches, padded_len, x.device, x.dtype)
+        time_tokens = time_tokens / counts
+        time_tokens = time_tokens.squeeze(2)[..., :actual_len].transpose(1, 2).contiguous()
+        time_tokens = time_tokens.reshape(batch_size, channels, actual_len, self.d_model)
+        time_tokens = self.channel_norm(time_tokens)
+        time_tokens = time_tokens.permute(0, 2, 1, 3).reshape(batch_size, actual_len, channels * self.d_model)
+        return self.output_norm(self.channel_fuse(time_tokens))
+
 
 def _make_strided_conv_encoder(
     input_channels: int,
@@ -170,7 +352,7 @@ def _make_strided_conv_encoder(
 
     layers = []
     in_channels = input_channels
-    for idx, (stride, kernel_size, pad) in enumerate(zip(strides, filters, padding)):
+    for stride, kernel_size, pad in zip(strides, filters, padding):
         layers.append(
             nn.Sequential(
                 nn.Conv1d(
@@ -208,7 +390,6 @@ class BoschCPCEncoder(nn.Module):
         if upsampler != "linear":
             raise ValueError(f"Unsupported upsampler: {upsampler}")
 
-        self.latent_dim = latent_dim
         self.upsampler = upsampler
         self.upsample_chunk_size = upsample_chunk_size
         self.upsample_chunk_threshold = upsample_chunk_threshold
@@ -388,7 +569,7 @@ class LNT(BaseModel):
         hidden_dim: int = 128,
         latent_dim: int = 64,
         transformation_type: str = "residual",
-        encoder_type: str = "patchtst_time",
+        encoder_type: str = "sensorformer_time",
         encoder_cfg: Optional[Dict[str, Any]] = None,
         transform_cfg: Optional[Dict[str, Any]] = None,
     ):
@@ -406,7 +587,27 @@ class LNT(BaseModel):
         if encoder_type == "cnn":
             encoder_hidden = int(encoder_cfg.get("hidden_dim", hidden_dim))
             self.encoder: nn.Module = CNNTimeEncoder(ts_channels, encoder_hidden, latent_dim)
-        elif encoder_type == "patchtst_time":
+        elif encoder_type == "modern_tcn":
+            cfg = {
+                "d_model": 128,
+                "num_layers": 4,
+                "kernel_sizes": [7, 7, 15, 15],
+                "dilations": [1, 2, 4, 8],
+                "ff_mult": 4,
+                "dropout": 0.1,
+                **encoder_cfg,
+            }
+            self.encoder = ModernTCNTimeEncoder(
+                input_channels=ts_channels,
+                latent_dim=latent_dim,
+                d_model=int(cfg["d_model"]),
+                num_layers=int(cfg["num_layers"]),
+                kernel_sizes=tuple(int(v) for v in cfg["kernel_sizes"]),
+                dilations=tuple(int(v) for v in cfg["dilations"]),
+                ff_mult=int(cfg["ff_mult"]),
+                dropout=float(cfg["dropout"]),
+            )
+        elif encoder_type == "sensorformer_time":
             cfg = {
                 "patch_len": 16,
                 "patch_stride": 8,
@@ -415,9 +616,10 @@ class LNT(BaseModel):
                 "num_layers": 3,
                 "d_ff": 256,
                 "dropout": 0.1,
+                "global_patches": 16,
                 **encoder_cfg,
             }
-            self.encoder = PatchTSTTimeEncoder(
+            self.encoder = SensorformerTimeEncoder(
                 input_channels=ts_channels,
                 seq_len=seq_len,
                 latent_dim=latent_dim,
@@ -428,7 +630,10 @@ class LNT(BaseModel):
                 num_layers=int(cfg["num_layers"]),
                 d_ff=int(cfg["d_ff"]),
                 dropout=float(cfg["dropout"]),
-                token_chunk_size=int(cfg["token_chunk_size"]) if "token_chunk_size" in cfg else None,
+                global_patches=int(cfg["global_patches"]),
+                attention_chunk_size=int(cfg["attention_chunk_size"])
+                if "attention_chunk_size" in cfg and cfg["attention_chunk_size"] is not None
+                else None,
             )
         elif encoder_type == "bosch_cpc":
             cfg = {
@@ -479,10 +684,9 @@ class LNT(BaseModel):
         return torch.cat([z.unsqueeze(2), z_transformed], dim=2)
 
 
-def _lnt_dcl_score(
+def per_timestep_dcl_score(
     combined: torch.Tensor,
     temperature: float,
-    eval_mode: bool,
     trans_diag_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     batch_size, seq_len, n_all, latent_dim = combined.shape
@@ -500,12 +704,19 @@ def _lnt_dcl_score(
 
     logits = logits.clone()
     logits[..., 1:].masked_fill_(trans_diag_mask.unsqueeze(0), float("-inf"))
-    loss_per_position = -sim_pos + torch.logsumexp(logits, dim=-1)
-    loss_per_sample = loss_per_position.sum(dim=-1).reshape(batch_size, seq_len)
+    return (-sim_pos + torch.logsumexp(logits, dim=-1)).sum(dim=-1).reshape(batch_size, seq_len)
 
+
+def _lnt_dcl_score(
+    combined: torch.Tensor,
+    temperature: float,
+    eval_mode: bool,
+    trans_diag_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    scores = per_timestep_dcl_score(combined, temperature=temperature, trans_diag_mask=trans_diag_mask)
     if eval_mode:
-        return loss_per_sample.mean(dim=1)
-    return loss_per_sample.mean()
+        return scores.mean(dim=1)
+    return scores.mean()
 
 
 class LNTLoss(Loss):
@@ -521,6 +732,12 @@ class LNTLoss(Loss):
             self._trans_diag_mask = torch.eye(n_trans, device=device, dtype=torch.bool)
         return self._trans_diag_mask
 
+    def per_timestep_scores(self, predictions: Tuple[torch.Tensor, ...]) -> torch.Tensor:
+        combined, = predictions
+        n_trans = combined.shape[2] - 1
+        diag_mask = self._get_trans_diag_mask(n_trans, combined.device)
+        return per_timestep_dcl_score(combined, self.temperature, trans_diag_mask=diag_mask)
+
     def forward(
         self,
         predictions: Tuple[torch.Tensor, ...],
@@ -529,10 +746,10 @@ class LNTLoss(Loss):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        combined, = predictions
-        n_trans = combined.shape[2] - 1
-        diag_mask = self._get_trans_diag_mask(n_trans, combined.device)
-        return _lnt_dcl_score(combined, self.temperature, eval_mode=eval, trans_diag_mask=diag_mask)
+        score_map = self.per_timestep_scores(predictions)
+        if eval:
+            return score_map.mean(dim=1)
+        return score_map.mean()
 
 
 class LNTAnomalyDetector(AnomalyDetector):
@@ -547,8 +764,9 @@ class LNTAnomalyDetector(AnomalyDetector):
     def compute_online_anomaly_score(self, inputs: Tuple[torch.Tensor, ...]) -> torch.Tensor:
         with torch.inference_mode():
             predictions = pack_tuple(self.model(inputs))
+            score_map = self.loss.per_timestep_scores(predictions)
 
-        return self.loss(predictions, eval=True)
+        return score_map[:, -1]
 
     def compute_offline_anomaly_score(self, inputs: Tuple[torch.Tensor, ...]) -> torch.Tensor:
         raise NotImplementedError
