@@ -58,6 +58,7 @@ class PatchTSTEncoder(nn.Module):
         dropout: float = 0.1,
         norm_first: bool = True,
         pooling: str = "mean",
+        token_chunk_size: int | None = None,
     ) -> None:
         super().__init__()
         self.seq_len = seq_len
@@ -65,6 +66,7 @@ class PatchTSTEncoder(nn.Module):
         self.patch_stride = patch_stride
         self.d_model = d_model
         self.pooling = pooling
+        self.token_chunk_size = token_chunk_size
 
         max_patches = _compute_num_patches(seq_len, patch_len, patch_stride)
         self.patch_proj = nn.Linear(patch_len, d_model)
@@ -99,7 +101,13 @@ class PatchTSTEncoder(nn.Module):
         tokens_out = []
         for tokens in tokens_in:
             for block in self.blocks:
-                tokens, _ = block(tokens)
+                if self.token_chunk_size is not None and tokens.shape[1] > self.token_chunk_size:
+                    token_chunks = []
+                    for token_chunk in tokens.split(self.token_chunk_size, dim=1):
+                        token_chunks.append(block(token_chunk)[0])
+                    tokens = torch.cat(token_chunks, dim=1)
+                else:
+                    tokens, _ = block(tokens)
             tokens_out.append(tokens)
         tokens = torch.cat(tokens_out, dim=0)
 
