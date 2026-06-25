@@ -694,11 +694,14 @@ def per_timestep_dcl_score(
 
     combined_flat = combined.contiguous().reshape(-1, n_all, latent_dim)
     combined_norm = F.normalize(combined_flat, p=2, dim=-1)
-    z_ori = combined_norm[:, :1, :]
     z_trans = combined_norm[:, 1:, :]
-    sim_pos = torch.sum(z_trans * z_ori, dim=-1) / temperature
 
     logits = torch.matmul(z_trans, combined_norm.transpose(-2, -1)) / temperature
+    # Column 0 == z_trans · combined_norm[:, 0] == (z_trans · z_ori) / temperature.
+    # The masked_fill_ below only touches logits[..., 1:], and sim_pos is taken from
+    # the pre-clone tensor, so reusing column 0 is numerically identical to the
+    # separate sum(z_trans * z_ori) / temperature.
+    sim_pos = logits[..., 0]
     if trans_diag_mask is None or trans_diag_mask.device != combined.device or trans_diag_mask.shape != (n_trans, n_trans):
         trans_diag_mask = torch.eye(n_trans, device=combined.device, dtype=torch.bool)
 
